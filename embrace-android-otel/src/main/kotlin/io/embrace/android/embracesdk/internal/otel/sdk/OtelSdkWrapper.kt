@@ -10,7 +10,9 @@ import io.embrace.android.embracesdk.internal.otel.createSdkOtelInstance
 import io.embrace.android.embracesdk.internal.otel.impl.EmbLoggerProvider
 import io.embrace.android.embracesdk.internal.otel.impl.EmbOpenTelemetry
 import io.embrace.android.embracesdk.internal.otel.impl.EmbTracerProvider
+import io.embrace.android.embracesdk.internal.otel.logs.DefaultLogRecordProcessor
 import io.embrace.android.embracesdk.internal.otel.logs.EventService
+import io.embrace.android.embracesdk.internal.otel.logs.ExternalLogRecordExporter
 import io.embrace.android.embracesdk.internal.otel.spans.SpanService
 import io.embrace.android.embracesdk.internal.utils.EmbTrace
 import io.opentelemetry.kotlin.Clock
@@ -53,6 +55,44 @@ class OtelSdkWrapper(
     val sdkLogger: Logger by lazy {
         EmbTrace.trace("otel-logger-init") {
             kotlinApi.loggerProvider.getLogger(
+                name = configuration.sdkName,
+                version = configuration.sdkVersion,
+            )
+        }
+    }
+
+    /**
+     * A logger whose pipeline contains only the externally registered log processors and exporters, not
+     * Embrace's own processor. It is used to replay telemetry that was persisted to disk in a previous process
+     * (e.g. a crash) so it reaches the configured OTel destinations without being stored again by Embrace.
+     *
+     * Null when no external log export is configured.
+     */
+    @Suppress("SpreadOperator")
+    val externalReplayLogger: Logger? by lazy {
+        val processors = configuration.getExternalLogRecordProcessors()
+        val exporters = configuration.getExternalLogExporters()
+        if (processors.isEmpty() && exporters.isEmpty()) {
+            return@lazy null
+        }
+        EmbTrace.trace("otel-replay-logger-init") {
+            val exportProcessors = when {
+                exporters.isEmpty() -> processors
+                else -> processors + DefaultLogRecordProcessor(ExternalLogRecordExporter(exporters))
+            }
+            createSdkOtelInstance(
+                useKotlinSdk = useKotlinSdk,
+                loggerProvider = {
+                    resource(attributes = configuration.resourceAction)
+                    logLimits {
+                        attributeCountLimit = limits.getMaxTotalAttributeCount()
+                    }
+                    export {
+                        compositeLogRecordProcessor(*exportProcessors.toTypedArray())
+                    }
+                },
+                clock = otelClock,
+            ).loggerProvider.getLogger(
                 name = configuration.sdkName,
                 version = configuration.sdkVersion,
             )

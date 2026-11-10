@@ -4,6 +4,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import io.embrace.android.embracesdk.assertions.assertMatches
 import io.embrace.android.embracesdk.assertions.assertOtelLogReceived
 import io.embrace.android.embracesdk.assertions.getLastLog
+import io.embrace.android.embracesdk.fakes.FakeLogRecordExporter
 import io.embrace.android.embracesdk.fakes.FakePayloadStorageService
 import io.embrace.android.embracesdk.fakes.TestPlatformSerializer
 import io.embrace.android.embracesdk.fakes.config.FakeInstrumentedConfig
@@ -86,6 +87,28 @@ internal class JvmCrashFeatureTest {
                 }
 
                 assertEquals("bar", crash.attributes?.single { it.key == "foo".toEmbraceAttributeName() }?.data)
+            }
+        )
+    }
+
+    @Test
+    fun `app crash is persisted for later delivery when only exporting via OTel`() {
+        testRule.runTest(
+            instrumentedConfig = FakeInstrumentedConfig(project = FakeProjectConfig(appId = null)),
+            preSdkStartAction = {
+                embrace.addLogRecordExporter(FakeLogRecordExporter())
+            },
+            testCaseAction = {
+                crashTimeMs = recordSession {
+                    simulateJvmUncaughtException(testException)
+                }.actionTimeMs
+            },
+            assertAction = {
+                payloadStorageService.getPersistedCrashLog().getLastLog().assertCrash(
+                    state = "foreground",
+                    crashIdFromSession = payloadStorageService.getPersistedSession().getCrashedId(),
+                    crashTimeMs = crashTimeMs,
+                )
             }
         )
     }

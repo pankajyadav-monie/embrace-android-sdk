@@ -132,7 +132,10 @@ internal class EmbraceSetupInterface(
                 networkConnectivityServiceProvider = { fakeNetworkConnectivityService },
             )
         },
-        deliveryModuleSupplier = { configService, initModule, otelModule, workerThreadModule, coreModule, essentialServiceModule, _, _, _, _ ->
+        deliveryModuleSupplier = {
+                configService, initModule, otelModule, workerThreadModule, coreModule, essentialServiceModule, _, _,
+                requestExecutionServiceProvider, _,
+            ->
             DeliveryModuleImpl(
                 configService = configService,
                 initModule = initModule,
@@ -140,7 +143,7 @@ internal class EmbraceSetupInterface(
                 workerThreadModule = workerThreadModule,
                 coreModule = coreModule,
                 essentialServiceModule = essentialServiceModule,
-                requestExecutionServiceProvider = null,
+                requestExecutionServiceProvider = requestExecutionServiceProvider,
                 payloadStorageServiceProvider = fakePayloadStorageService?.let { { it } },
                 cacheStorageServiceProvider = fakeCacheStorageService?.let { { it } },
                 deliveryTracer = deliveryTracer

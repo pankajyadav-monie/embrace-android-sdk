@@ -51,6 +51,33 @@ internal class OpenTelemetrySdkTest {
     }
 
     @Test
+    fun `replay logger exports to external exporters but not to the embrace log sink`() {
+        checkNotNull(sdk.externalReplayLogger).emit(body = "replayed")
+        assertEquals("replayed", logExporter.exportedLogs.single().body?.toString())
+        assertEquals(0, logSink.logsForNextBatch().size)
+    }
+
+    @Test
+    fun `replay logger is null when no external log export is configured`() {
+        val wrapper = OtelSdkWrapper(
+            otelClock = FakeOtelKotlinClock(FakeClock()),
+            configuration = OtelSdkConfig(
+                spanSink = spanSink,
+                logSink = logSink,
+                sdkName = "sdk",
+                sdkVersion = "1.0",
+                appVersion = "2.5.1",
+                packageName = "com.test.app",
+                systemInfo = systemInfo,
+            ),
+            spanService = FakeSpanService(),
+            eventService = EventServiceImpl { sdk.sdkLogger },
+            useKotlinSdk = false,
+        )
+        assertNull(wrapper.externalReplayLogger)
+    }
+
+    @Test
     fun `check resource added by sdk logger`() {
         sdk.sdkLogger.emit()
         checkNotNull(logExporter.exportedLogs).single().resource.assertExpectedAttributes(

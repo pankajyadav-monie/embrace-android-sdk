@@ -2,6 +2,8 @@ package io.embrace.android.embracesdk.internal.injection
 
 import android.content.Context
 import io.embrace.android.embracesdk.internal.config.ConfigService
+import io.embrace.android.embracesdk.internal.delivery.execution.OtelReplayRequestExecutionService
+import io.embrace.android.embracesdk.internal.delivery.execution.RequestExecutionService
 import io.embrace.android.embracesdk.internal.instrumentation.startup.DataCaptureServiceModule
 import io.embrace.android.embracesdk.internal.instrumentation.startup.DataCaptureServiceModuleSupplier
 import io.embrace.android.embracesdk.internal.instrumentation.thread.blockage.ThreadBlockageService
@@ -9,6 +11,7 @@ import io.embrace.android.embracesdk.internal.instrumentation.thread.blockage.Th
 import io.embrace.android.embracesdk.internal.storage.StorageService
 import io.embrace.android.embracesdk.internal.utils.BuildVersionChecker
 import io.embrace.android.embracesdk.internal.utils.EmbTrace
+import io.embrace.android.embracesdk.internal.utils.Provider
 import io.embrace.android.embracesdk.internal.utils.VersionChecker
 
 /**
@@ -115,9 +118,24 @@ internal class InitializedModuleGraph(
     }
 
     override val deliveryModule: DeliveryModule? = init {
-        if (configService.isOnlyUsingOtelExporters()) {
+        val otelOnly = configService.isOnlyUsingOtelExporters()
+        if (otelOnly && !openTelemetryModule.otelSdkConfig.hasConfiguredOtlpExport()) {
             null
         } else {
+            // Without an app ID, keep the full delivery pipeline (persistence, crash handling, resurrection) but
+            // deliver persisted crashes to the configured OTel exporters instead of the Embrace backend.
+            val requestExecutionServiceProvider: Provider<RequestExecutionService>? = when {
+                otelOnly -> {
+                    {
+                        OtelReplayRequestExecutionService(
+                            replayLoggerProvider = { openTelemetryModule.otelSdkWrapper.externalReplayLogger },
+                            serializer = initModule.jsonSerializer,
+                            logger = initModule.logger,
+                        )
+                    }
+                }
+                else -> null
+            }
             deliveryModuleSupplier(
                 configService,
                 initModule,
@@ -127,7 +145,7 @@ internal class InitializedModuleGraph(
                 essentialServiceModule,
                 null,
                 null,
-                null,
+                requestExecutionServiceProvider,
                 null
             )
         }

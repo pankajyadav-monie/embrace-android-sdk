@@ -123,6 +123,8 @@ class OtelSdkConfig(
 
     fun getExternalLogRecordProcessors(): List<LogRecordProcessor> = externalLogRecordProcessors.toList()
 
+    fun getExternalLogExporters(): List<LogRecordExporter> = externalLogExporters.toList()
+
     fun hasConfiguredOtlpExport(): Boolean = externalLogExporters.isNotEmpty() || externalLogRecordProcessors.isNotEmpty() ||
         externalSpanExporters.isNotEmpty() || externalSpanProcessors.isNotEmpty()
 
