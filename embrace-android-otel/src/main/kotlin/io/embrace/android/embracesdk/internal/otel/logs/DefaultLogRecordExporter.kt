@@ -14,6 +14,7 @@ import io.opentelemetry.kotlin.logging.model.ReadableLogRecord
 internal class DefaultLogRecordExporter(
     private val logSink: LogSink,
     private val externalExporters: List<LogRecordExporter>,
+    private val externalExportFilter: (ReadableLogRecord) -> Boolean = { true },
     private val exportCheck: () -> Boolean,
 ) : LogRecordExporter {
 
@@ -28,8 +29,8 @@ internal class DefaultLogRecordExporter(
                 externalExporters.forEach { exporter ->
                     try {
                         exporter.export(
-                            telemetry.filterNot {
-                                it.attributes.containsKey(PrivateSpan.key)
+                            telemetry.filter {
+                                !it.attributes.containsKey(PrivateSpan.key) && externalExportFilter(it)
                             }
                         )
                     } catch (ignored: Throwable) {

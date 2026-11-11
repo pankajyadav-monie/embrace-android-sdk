@@ -126,7 +126,9 @@ internal class InitializedModuleGraph(
             // deliver persisted crashes and thread blockages to the configured OTel exporters instead of the Embrace backend.
             val requestExecutionServiceProvider: Provider<RequestExecutionService>? = when {
                 otelOnly -> {
-                    {
+                    // Crashes are delivered by the replay, so exporting them live as well would duplicate them.
+                    openTelemetryModule.otelSdkConfig.disableLiveCrashExport()
+                    val replayServiceProvider: Provider<RequestExecutionService> = {
                         OtelReplayRequestExecutionService(
                             replayLoggerProvider = { openTelemetryModule.otelSdkWrapper.externalReplayLogger },
                             serializer = initModule.jsonSerializer,
@@ -134,6 +136,7 @@ internal class InitializedModuleGraph(
                             replayTracerProvider = { openTelemetryModule.otelSdkWrapper.externalReplayTracer },
                         )
                     }
+                    replayServiceProvider
                 }
                 else -> null
             }

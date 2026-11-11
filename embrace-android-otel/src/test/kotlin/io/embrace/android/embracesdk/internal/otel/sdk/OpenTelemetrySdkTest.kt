@@ -3,6 +3,7 @@ package io.embrace.android.embracesdk.internal.otel.sdk
 import io.embrace.android.embracesdk.assertions.assertExpectedAttributes
 import io.embrace.android.embracesdk.fakes.FakeClock
 import io.embrace.android.embracesdk.fakes.FakeLogRecordExporter
+import io.embrace.android.embracesdk.fakes.FakeLogRecordProcessor
 import io.embrace.android.embracesdk.fakes.FakeOtelKotlinClock
 import io.embrace.android.embracesdk.fakes.FakeSpanExporter
 import io.embrace.android.embracesdk.fakes.FakeSpanService
@@ -17,6 +18,7 @@ import io.embrace.android.embracesdk.internal.utils.Provider
 import io.opentelemetry.kotlin.logging.Logger
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
@@ -75,6 +77,42 @@ internal class OpenTelemetrySdkTest {
             useKotlinSdk = false,
         )
         assertNull(wrapper.externalReplayLogger)
+    }
+
+    @Test
+    fun `crash logs are exported live by default`() {
+        sdk.sdkLogger.emit(body = "crash", attributes = { setStringAttribute("emb.type", "sys.android.crash") })
+
+        assertEquals("crash", logExporter.exportedLogs.single().body?.toString())
+    }
+
+    @Test
+    fun `crash logs are not exported live when live crash export is disabled but are still stored`() {
+        configuration.disableLiveCrashExport()
+
+        sdk.sdkLogger.emit(body = "crash", attributes = { setStringAttribute("emb.type", "sys.android.crash") })
+        sdk.sdkLogger.emit(body = "rn crash", attributes = { setStringAttribute("emb.type", "sys.android.react_native_crash") })
+        sdk.sdkLogger.emit(body = "log", attributes = { setStringAttribute("emb.type", "sys.log") })
+
+        assertEquals(listOf("log"), logExporter.exportedLogs.map { it.body?.toString() })
+        assertEquals(3, logSink.logsForNextBatch().size)
+    }
+
+    @Test
+    fun `crash logs skip external processors in the live pipeline but not the replay logger`() {
+        val processor = FakeLogRecordProcessor()
+        configuration.addLogRecordProcessor(processor)
+        configuration.disableLiveCrashExport()
+
+        sdk.sdkLogger.emit(body = "crash", attributes = { setStringAttribute("emb.type", "sys.android.crash") })
+        assertTrue(processor.processedLogBodies.isEmpty())
+
+        checkNotNull(sdk.externalReplayLogger).logger.emit(
+            body = "replayed crash",
+            attributes = { setStringAttribute("emb.type", "sys.android.crash") },
+        )
+        assertEquals(listOf("replayed crash"), processor.processedLogBodies)
+        assertEquals("replayed crash", logExporter.exportedLogs.single().body?.toString())
     }
 
     @Test

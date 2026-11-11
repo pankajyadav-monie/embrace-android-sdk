@@ -182,7 +182,7 @@ class OtelSdkWrapper(
                     attributeCountLimit = limits.getMaxTotalAttributeCount()
                 }
                 export {
-                    val processors = listOf(configuration.logRecordProcessor) + configuration.getExternalLogRecordProcessors()
+                    val processors = listOf(configuration.logRecordProcessor) + configuration.getLiveExternalLogRecordProcessors()
                     compositeLogRecordProcessor(*processors.toTypedArray())
                 }
             },
