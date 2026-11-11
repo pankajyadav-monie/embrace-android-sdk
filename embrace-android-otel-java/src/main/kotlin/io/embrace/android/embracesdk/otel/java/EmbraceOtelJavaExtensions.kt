@@ -18,14 +18,14 @@ import io.opentelemetry.kotlin.tracing.export.toOtelKotlinSpanProcessor
  * Adds an [OtelJavaSpanExporter] that OTel Spans will be exported to after completion.
  */
 fun SdkApi.addJavaSpanExporter(spanExporter: OtelJavaSpanExporter) {
-    this.addSpanExporter(spanExporter.toOtelKotlinSpanExporter())
+    this.addSpanExporter(ReplayAwareSpanExporter(spanExporter).toOtelKotlinSpanExporter())
 }
 
 /**
  * Adds an [OtelJavaLogRecordExporter] that OTel LogRecords will be exported to after completion.
  */
 fun SdkApi.addJavaLogRecordExporter(logRecordExporter: OtelJavaLogRecordExporter) {
-    this.addLogRecordExporter(logRecordExporter.toOtelKotlinLogRecordExporter())
+    this.addLogRecordExporter(ReplayAwareLogRecordExporter(logRecordExporter).toOtelKotlinLogRecordExporter())
 }
 
 /**
@@ -33,7 +33,7 @@ fun SdkApi.addJavaLogRecordExporter(logRecordExporter: OtelJavaLogRecordExporter
  * Processors must be added before the SDK has started or they will be ignored.
  */
 fun SdkApi.addJavaSpanProcessor(spanProcessor: OtelJavaSpanProcessor) {
-    this.addSpanProcessor(spanProcessor.toOtelKotlinSpanProcessor())
+    this.addSpanProcessor(ReplayAwareSpanProcessor(spanProcessor).toOtelKotlinSpanProcessor())
 }
 
 /**
@@ -41,7 +41,7 @@ fun SdkApi.addJavaSpanProcessor(spanProcessor: OtelJavaSpanProcessor) {
  * Processors must be added before the SDK has started or they will be ignored.
  */
 fun SdkApi.addJavaLogRecordProcessor(logRecordProcessor: OtelJavaLogRecordProcessor) {
-    this.addLogRecordProcessor(logRecordProcessor.toOtelKotlinLogRecordProcessor())
+    this.addLogRecordProcessor(ReplayAwareLogRecordProcessor(logRecordProcessor).toOtelKotlinLogRecordProcessor())
 }
 
 /**

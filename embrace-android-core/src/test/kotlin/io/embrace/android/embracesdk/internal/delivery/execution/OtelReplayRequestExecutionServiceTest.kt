@@ -9,6 +9,7 @@ import io.embrace.android.embracesdk.fakes.FakeSpanExporter
 import io.embrace.android.embracesdk.fakes.FakeSpanService
 import io.embrace.android.embracesdk.internal.SystemInfo
 import io.embrace.android.embracesdk.internal.delivery.SupportedEnvelopeType
+import io.embrace.android.embracesdk.internal.otel.ReplayExport
 import io.embrace.android.embracesdk.internal.otel.config.OtelSdkConfig
 import io.embrace.android.embracesdk.internal.otel.logs.EventServiceImpl
 import io.embrace.android.embracesdk.internal.otel.logs.LogSinkImpl
@@ -24,6 +25,8 @@ import io.embrace.android.embracesdk.internal.payload.SpanEvent
 import io.embrace.android.embracesdk.internal.serialization.EmbraceSerializer
 import io.opentelemetry.kotlin.export.OperationResultCode
 import io.opentelemetry.kotlin.logging.SeverityNumber
+import io.opentelemetry.kotlin.logging.export.LogRecordExporter
+import io.opentelemetry.kotlin.logging.model.ReadableLogRecord
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -42,6 +45,7 @@ internal class OtelReplayRequestExecutionServiceTest {
     private lateinit var spanExporter: FakeSpanExporter
     private lateinit var processor: FakeLogRecordProcessor
     private lateinit var logger: FakeInternalLogger
+    private val replayActiveDuringExport = mutableListOf<Boolean>()
     private lateinit var service: OtelReplayRequestExecutionService
     private val serializer = EmbraceSerializer()
 
@@ -110,6 +114,15 @@ internal class OtelReplayRequestExecutionServiceTest {
         ).apply {
             addLogExporter(exporter)
             addLogRecordProcessor(processor)
+            addLogExporter(object : LogRecordExporter {
+                override suspend fun export(telemetry: List<ReadableLogRecord>): OperationResultCode {
+                    replayActiveDuringExport += ReplayExport.isActive
+                    return OperationResultCode.Success
+                }
+
+                override suspend fun forceFlush(): OperationResultCode = OperationResultCode.Success
+                override suspend fun shutdown(): OperationResultCode = OperationResultCode.Success
+            })
             addSpanExporter(spanExporter)
         }
         lateinit var wrapper: OtelSdkWrapper
@@ -303,6 +316,34 @@ internal class OtelReplayRequestExecutionServiceTest {
 
         assertTrue(result is ExecutionResult.Incomplete)
         assertTrue(result.shouldRetry)
+    }
+
+    @Test
+    fun `exports during a replay run with the replay flag set so java exporters report their real result`() {
+        assertEquals(ExecutionResult.Success, deliver(SupportedEnvelopeType.CRASH, crashLog))
+
+        assertEquals(listOf(true), replayActiveDuringExport)
+        assertFalse(ReplayExport.isActive)
+    }
+
+    @Test
+    fun `thread blockages of a session that ended in a jvm crash are not replayed`() {
+        val crashInSession = crashLog.copy(attributes = crashLog.attributes.orEmpty() + Attribute("session.id", SESSION_ID))
+        assertEquals(ExecutionResult.Success, deliver(SupportedEnvelopeType.CRASH, crashInSession))
+
+        val result = deliverSession(SessionPartPayload(spans = listOf(sessionSpan, snapshotBlockage)))
+
+        assertEquals(ExecutionResult.Success, result)
+        assertTrue(spanExporter.exportedSpans.isEmpty())
+    }
+
+    @Test
+    fun `thread blockages of other sessions are still replayed after a jvm crash`() {
+        val crashInOtherSession = crashLog.copy(attributes = crashLog.attributes.orEmpty() + Attribute("session.id", "OTHER"))
+        assertEquals(ExecutionResult.Success, deliver(SupportedEnvelopeType.CRASH, crashInOtherSession))
+
+        assertEquals(ExecutionResult.Success, deliverSession(SessionPartPayload(spans = listOf(sessionSpan, snapshotBlockage))))
+        assertEquals(1, spanExporter.exportedSpans.size)
     }
 
     private fun deliverSession(payload: SessionPartPayload): ExecutionResult {

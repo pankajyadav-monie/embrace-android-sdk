@@ -5,6 +5,7 @@ import io.embrace.android.embracesdk.internal.arch.schema.PrivateSpan
 import io.embrace.android.embracesdk.internal.delivery.SupportedEnvelopeType
 import io.embrace.android.embracesdk.internal.logging.InternalErrorType
 import io.embrace.android.embracesdk.internal.logging.InternalLogger
+import io.embrace.android.embracesdk.internal.otel.ReplayExport
 import io.embrace.android.embracesdk.internal.otel.sdk.ExternalReplayLogger
 import io.embrace.android.embracesdk.internal.otel.sdk.ExternalReplayTracer
 import io.embrace.android.embracesdk.internal.otel.sdk.findAttributeValue
@@ -21,6 +22,7 @@ import io.opentelemetry.kotlin.logging.SeverityNumber
 import io.opentelemetry.kotlin.semconv.SessionAttributes
 import io.opentelemetry.kotlin.tracing.SpanKind
 import java.io.InputStream
+import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.GZIPInputStream
 
 /**
@@ -44,6 +46,11 @@ import java.util.zip.GZIPInputStream
  * synchronous exporter can deliver the crash live before the process dies, and it is replayed again here. Replayed
  * telemetry carries [REPLAYED_ATTRIBUTE] so backends can deduplicate on `log.record.uid`. A retry after a partial
  * failure also re-sends to exporters that already succeeded.
+ *
+ * A JVM crash ends its session live, which exports the session's thread blockages before the process dies. The
+ * session's last periodic cache can still be resurrected as a second SESSION envelope whose blockages lack the
+ * sequence id, so blockages from sessions that ended in a replayed JVM crash are not replayed. This relies on CRASH
+ * envelopes being delivered before SESSION envelopes, which the delivery priority order guarantees.
  */
 class OtelReplayRequestExecutionService(
     private val replayLoggerProvider: () -> ExternalReplayLogger?,
@@ -51,6 +58,9 @@ class OtelReplayRequestExecutionService(
     private val logger: InternalLogger,
     private val replayTracerProvider: () -> ExternalReplayTracer? = { null },
 ) : RequestExecutionService {
+
+    /** Sessions that ended in a JVM crash, whose thread blockages were exported live when the session ended. */
+    private val sessionsEndedByJvmCrash: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     override fun attemptHttpRequest(
         payloadStream: () -> InputStream,
@@ -71,6 +81,7 @@ class OtelReplayRequestExecutionService(
                 serializer.fromJson(it, Envelope.logEnvelopeType)
             }
             val logs = envelope.data.logs?.filter(::isReplayable).orEmpty()
+            logs.mapNotNullTo(sessionsEndedByJvmCrash) { it.attributes?.findAttributeValue(SESSION_ID_ATTRIBUTE) }
             logs.forEach { replay(replayLogger.logger, it) }
             logs.isNotEmpty()
         }
@@ -83,6 +94,9 @@ class OtelReplayRequestExecutionService(
                 serializer.fromJson(it, Envelope.sessionEnvelopeType)
             }
             val sessionId = envelope.getSessionId()
+            if (sessionId != null && sessionId in sessionsEndedByJvmCrash) {
+                return@readAndReplay false
+            }
             val blockages = ((envelope.data.spans ?: emptyList()) + (envelope.data.spanSnapshots ?: emptyList()))
                 .filter(::isUnexportedThreadBlockage)
                 .distinctBy { it.spanId }
@@ -94,18 +108,20 @@ class OtelReplayRequestExecutionService(
     /**
      * Runs [replay], which returns whether it replayed anything, then flushes the pipeline. An unreadable payload is
      * not retried because it will not become readable; a failed export is, because the exporter may recover.
+     *
+     * Both run inside [ReplayExport.run], so Java-backed exporters wait for and report their real result.
      */
-    private fun readAndReplay(flush: () -> Boolean, replay: () -> Boolean): ExecutionResult {
+    private fun readAndReplay(flush: () -> Boolean, replay: () -> Boolean): ExecutionResult = ReplayExport.run {
         val replayed = try {
             replay()
         } catch (exc: Throwable) {
             logger.trackInternalError(InternalErrorType.PayloadDeliveryFail, exc)
-            return ExecutionResult.Incomplete(exc, retry = false)
+            return@run ExecutionResult.Incomplete(exc, retry = false)
         }
-        if (!replayed || flush()) {
-            return ExecutionResult.Success
+        when {
+            !replayed || flush() -> ExecutionResult.Success
+            else -> ExecutionResult.Incomplete(IllegalStateException("Replay to external OTel exporters failed"), retry = true)
         }
-        return ExecutionResult.Incomplete(IllegalStateException("Replay to external OTel exporters failed"), retry = true)
     }
 
     private fun isReplayable(log: Log): Boolean {
