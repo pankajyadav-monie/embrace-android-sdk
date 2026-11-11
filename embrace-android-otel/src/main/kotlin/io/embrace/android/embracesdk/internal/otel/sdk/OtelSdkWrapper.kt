@@ -10,8 +10,8 @@ import io.embrace.android.embracesdk.internal.otel.createSdkOtelInstance
 import io.embrace.android.embracesdk.internal.otel.impl.EmbLoggerProvider
 import io.embrace.android.embracesdk.internal.otel.impl.EmbOpenTelemetry
 import io.embrace.android.embracesdk.internal.otel.impl.EmbTracerProvider
-import io.embrace.android.embracesdk.internal.otel.logs.DefaultLogRecordProcessor
 import io.embrace.android.embracesdk.internal.otel.logs.EventService
+import io.embrace.android.embracesdk.internal.otel.logs.ExportResultTrackingLogRecordProcessor
 import io.embrace.android.embracesdk.internal.otel.logs.ExternalLogRecordExporter
 import io.embrace.android.embracesdk.internal.otel.spans.ExportOnEndSpanProcessor
 import io.embrace.android.embracesdk.internal.otel.spans.ExternalSpanExporter
@@ -19,10 +19,12 @@ import io.embrace.android.embracesdk.internal.otel.spans.SpanService
 import io.embrace.android.embracesdk.internal.utils.EmbTrace
 import io.opentelemetry.kotlin.Clock
 import io.opentelemetry.kotlin.OpenTelemetry
+import io.opentelemetry.kotlin.export.OperationResultCode
 import io.opentelemetry.kotlin.logging.Logger
 import io.opentelemetry.kotlin.logging.export.compositeLogRecordProcessor
 import io.opentelemetry.kotlin.tracing.Tracer
 import io.opentelemetry.kotlin.tracing.export.compositeSpanProcessor
+import kotlinx.coroutines.runBlocking
 
 /**
  * Wrapper that instantiates a copy of the OpenTelemetry SDK configured with the appropriate settings and the given components so
@@ -71,7 +73,7 @@ class OtelSdkWrapper(
      * Null when no external log export is configured.
      */
     @Suppress("SpreadOperator")
-    val externalReplayLogger: Logger? by lazy {
+    val externalReplayLogger: ExternalReplayLogger? by lazy {
         val processors = configuration.getExternalLogRecordProcessors()
         val exporters = configuration.getExternalLogExporters()
         if (processors.isEmpty() && exporters.isEmpty()) {
@@ -80,9 +82,9 @@ class OtelSdkWrapper(
         EmbTrace.trace("otel-replay-logger-init") {
             val exportProcessors = when {
                 exporters.isEmpty() -> processors
-                else -> processors + DefaultLogRecordProcessor(ExternalLogRecordExporter(exporters))
+                else -> processors + ExportResultTrackingLogRecordProcessor(ExternalLogRecordExporter(exporters))
             }
-            createSdkOtelInstance(
+            val instance = createSdkOtelInstance(
                 useKotlinSdk = useKotlinSdk,
                 loggerProvider = {
                     resource(attributes = configuration.resourceAction)
@@ -94,9 +96,13 @@ class OtelSdkWrapper(
                     }
                 },
                 clock = otelClock,
-            ).loggerProvider.getLogger(
-                name = configuration.sdkName,
-                version = configuration.sdkVersion,
+            )
+            ExternalReplayLogger(
+                logger = instance.loggerProvider.getLogger(
+                    name = configuration.sdkName,
+                    version = configuration.sdkVersion,
+                ),
+                flushAction = { flushAll { exportProcessors.map { runCatching { it.forceFlush() }.getOrNull() } } },
             )
         }
     }
@@ -141,8 +147,17 @@ class OtelSdkWrapper(
                     version = configuration.sdkVersion,
                 ),
                 rootContext = instance.context.root(),
+                flushAction = { flushAll { exportProcessors.map { runCatching { it.forceFlush() }.getOrNull() } } },
             )
         }
+    }
+
+    /**
+     * Flushes every processor, including user-supplied batching ones, so replayed telemetry has actually been handed
+     * to the exporters before the persisted payload is deleted. Returns true only if every flush succeeded.
+     */
+    private fun flushAll(flush: suspend () -> List<OperationResultCode?>): Boolean = runBlocking {
+        flush().all { it == OperationResultCode.Success }
     }
 
     @Suppress("DEPRECATION", "SpreadOperator")

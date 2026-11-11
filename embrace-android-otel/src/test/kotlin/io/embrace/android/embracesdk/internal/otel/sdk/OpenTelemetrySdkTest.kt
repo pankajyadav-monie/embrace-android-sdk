@@ -52,7 +52,7 @@ internal class OpenTelemetrySdkTest {
 
     @Test
     fun `replay logger exports to external exporters but not to the embrace log sink`() {
-        checkNotNull(sdk.externalReplayLogger).emit(body = "replayed")
+        checkNotNull(sdk.externalReplayLogger).logger.emit(body = "replayed")
         assertEquals("replayed", logExporter.exportedLogs.single().body?.toString())
         assertEquals(0, logSink.logsForNextBatch().size)
     }

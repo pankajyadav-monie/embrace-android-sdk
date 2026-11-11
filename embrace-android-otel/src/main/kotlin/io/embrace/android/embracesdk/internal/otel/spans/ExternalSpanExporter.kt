@@ -1,6 +1,7 @@
 package io.embrace.android.embracesdk.internal.otel.spans
 
 import io.embrace.android.embracesdk.internal.arch.schema.PrivateSpan
+import io.embrace.android.embracesdk.internal.otel.exportToAll
 import io.opentelemetry.kotlin.context.Context
 import io.opentelemetry.kotlin.export.OperationResultCode
 import io.opentelemetry.kotlin.tracing.data.SpanData
@@ -9,6 +10,7 @@ import io.opentelemetry.kotlin.tracing.export.SpanProcessor
 import io.opentelemetry.kotlin.tracing.model.ReadWriteSpan
 import io.opentelemetry.kotlin.tracing.model.ReadableSpan
 import kotlinx.coroutines.runBlocking
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Exports spans only to externally registered exporters, skipping Embrace's [SpanSink].
@@ -21,20 +23,7 @@ internal class ExternalSpanExporter(
 
     override suspend fun export(telemetry: List<SpanData>): OperationResultCode {
         val exportable = telemetry.filterNot { it.attributes.containsKey(PrivateSpan.key) }
-        if (exportable.isEmpty()) {
-            return OperationResultCode.Success
-        }
-        var result: OperationResultCode = OperationResultCode.Success
-        externalExporters.forEach { exporter ->
-            try {
-                if (exporter.export(exportable) != OperationResultCode.Success) {
-                    result = OperationResultCode.Failure
-                }
-            } catch (ignored: Throwable) {
-                result = OperationResultCode.Failure
-            }
-        }
-        return result
+        return externalExporters.exportToAll(exportable) { export(it) }
     }
 
     override suspend fun forceFlush(): OperationResultCode = OperationResultCode.Success
@@ -42,12 +31,15 @@ internal class ExternalSpanExporter(
 }
 
 /**
- * Exports each span as soon as it ends. Unlike [EmbraceSpanProcessor] it adds no attributes, so replayed spans keep
- * the session and process they were recorded in rather than the current ones.
+ * Exports each span synchronously as soon as it ends and remembers whether any export failed, so that [forceFlush]
+ * can report it. Unlike [EmbraceSpanProcessor] it adds no attributes, so replayed spans keep the session and process
+ * they were recorded in rather than the current ones.
  */
 internal class ExportOnEndSpanProcessor(
     private val spanExporter: SpanExporter,
 ) : SpanProcessor {
+
+    private val failed = AtomicBoolean(false)
 
     override fun onStart(span: ReadWriteSpan, parentContext: Context) {
     }
@@ -56,11 +48,20 @@ internal class ExportOnEndSpanProcessor(
     }
 
     override fun onEnd(span: ReadableSpan) {
-        runBlocking { spanExporter.export(listOf(span)) }
+        val result = runCatching { runBlocking { spanExporter.export(listOf(span)) } }.getOrNull()
+        if (result != OperationResultCode.Success) {
+            failed.set(true)
+        }
     }
 
     override fun isStartRequired(): Boolean = false
     override fun isEndRequired(): Boolean = true
-    override suspend fun forceFlush(): OperationResultCode = OperationResultCode.Success
+
+    /** Fails if any export since the previous flush failed, then resets. */
+    override suspend fun forceFlush(): OperationResultCode = when {
+        failed.getAndSet(false) -> OperationResultCode.Failure
+        else -> OperationResultCode.Success
+    }
+
     override suspend fun shutdown(): OperationResultCode = OperationResultCode.Success
 }

@@ -3,6 +3,7 @@ package io.embrace.android.embracesdk.internal.delivery.execution
 import io.embrace.android.embracesdk.fakes.FakeClock
 import io.embrace.android.embracesdk.fakes.FakeInternalLogger
 import io.embrace.android.embracesdk.fakes.FakeLogRecordExporter
+import io.embrace.android.embracesdk.fakes.FakeLogRecordProcessor
 import io.embrace.android.embracesdk.fakes.FakeOtelKotlinClock
 import io.embrace.android.embracesdk.fakes.FakeSpanExporter
 import io.embrace.android.embracesdk.fakes.FakeSpanService
@@ -21,6 +22,7 @@ import io.embrace.android.embracesdk.internal.payload.SessionPartPayload
 import io.embrace.android.embracesdk.internal.payload.Span
 import io.embrace.android.embracesdk.internal.payload.SpanEvent
 import io.embrace.android.embracesdk.internal.serialization.EmbraceSerializer
+import io.opentelemetry.kotlin.export.OperationResultCode
 import io.opentelemetry.kotlin.logging.SeverityNumber
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -38,6 +40,7 @@ internal class OtelReplayRequestExecutionServiceTest {
 
     private lateinit var exporter: FakeLogRecordExporter
     private lateinit var spanExporter: FakeSpanExporter
+    private lateinit var processor: FakeLogRecordProcessor
     private lateinit var logger: FakeInternalLogger
     private lateinit var service: OtelReplayRequestExecutionService
     private val serializer = EmbraceSerializer()
@@ -94,6 +97,7 @@ internal class OtelReplayRequestExecutionServiceTest {
     fun setUp() {
         exporter = FakeLogRecordExporter()
         spanExporter = FakeSpanExporter()
+        processor = FakeLogRecordProcessor()
         logger = FakeInternalLogger(throwOnInternalError = false)
         val config = OtelSdkConfig(
             spanSink = SpanSinkImpl(),
@@ -105,6 +109,7 @@ internal class OtelReplayRequestExecutionServiceTest {
             systemInfo = SystemInfo(),
         ).apply {
             addLogExporter(exporter)
+            addLogRecordProcessor(processor)
             addSpanExporter(spanExporter)
         }
         lateinit var wrapper: OtelSdkWrapper
@@ -245,6 +250,59 @@ internal class OtelReplayRequestExecutionServiceTest {
         assertTrue(result is ExecutionResult.Incomplete)
         assertFalse(result.shouldRetry)
         assertEquals(1, logger.internalErrorMessages.size)
+    }
+
+    @Test
+    fun `crash is kept for retry when an exporter fails`() {
+        exporter.exportResult = OperationResultCode.Failure
+
+        val result = deliver(SupportedEnvelopeType.CRASH, crashLog)
+
+        assertTrue(result is ExecutionResult.Incomplete)
+        assertTrue(result.shouldRetry)
+        assertEquals(1, exporter.exportedLogs.size)
+    }
+
+    @Test
+    fun `crash is delivered on retry once the exporter recovers`() {
+        exporter.exportResult = OperationResultCode.Failure
+        assertTrue(deliver(SupportedEnvelopeType.CRASH, crashLog).shouldRetry)
+
+        exporter.exportResult = OperationResultCode.Success
+        assertEquals(ExecutionResult.Success, deliver(SupportedEnvelopeType.CRASH, crashLog))
+    }
+
+    @Test
+    fun `external processors are flushed before a crash is reported as delivered`() {
+        assertEquals(ExecutionResult.Success, deliver(SupportedEnvelopeType.CRASH, crashLog))
+
+        assertEquals(listOf(""), processor.processedLogBodies)
+        assertEquals(1, processor.forceFlushCount)
+    }
+
+    @Test
+    fun `crash is kept for retry when an external processor fails to flush`() {
+        processor.forceFlushResult = OperationResultCode.Failure
+
+        assertTrue(deliver(SupportedEnvelopeType.CRASH, crashLog).shouldRetry)
+    }
+
+    @Test
+    fun `nothing is flushed when a crash envelope has nothing to replay`() {
+        val log = crashLog.copy(attributes = listOf(Attribute("emb.type", "sys.log")))
+
+        assertEquals(ExecutionResult.Success, deliver(SupportedEnvelopeType.CRASH, log))
+        assertEquals(0, processor.forceFlushCount)
+    }
+
+    @Test
+    fun `thread blockage is kept for retry when a span exporter fails`() {
+        spanExporter.exportResult = OperationResultCode.Failure
+
+        val result = deliverSession(SessionPartPayload(spans = listOf(sessionSpan, snapshotBlockage)))
+
+        assertTrue(result is ExecutionResult.Incomplete)
+        assertTrue(result.shouldRetry)
     }
 
     private fun deliverSession(payload: SessionPartPayload): ExecutionResult {

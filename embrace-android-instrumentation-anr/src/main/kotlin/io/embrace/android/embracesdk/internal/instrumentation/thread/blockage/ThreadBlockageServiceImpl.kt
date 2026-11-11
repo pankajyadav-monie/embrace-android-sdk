@@ -71,6 +71,11 @@ internal class ThreadBlockageServiceImpl(
         blockedThreadDetector.stop()
     }
 
+    /**
+     * These spans bypass the OTel pipeline on purpose, so they never carry `emb.private.sequence_id`. In OTel-only
+     * mode, OtelReplayRequestExecutionService relies on that to tell blockages that were never exported live (these)
+     * from ones that were (from [record]). Routing snapshots through the pipeline would make them be dropped on replay.
+     */
     override fun snapshotSpans(): List<Span> = EmbTrace.trace("anr-snapshot") {
         stacktraceSampler.getThreadBlockageIntervals().map { interval ->
             mapIntervalToSpan(interval, clock, random)

@@ -4,13 +4,15 @@ import io.opentelemetry.kotlin.export.OperationResultCode
 import io.opentelemetry.kotlin.tracing.data.SpanData
 import io.opentelemetry.kotlin.tracing.export.SpanExporter
 
-class FakeSpanExporter : SpanExporter {
+class FakeSpanExporter(
+    var exportResult: OperationResultCode = OperationResultCode.Success,
+) : SpanExporter {
 
     val exportedSpans: MutableList<SpanData> = mutableListOf()
 
     override suspend fun export(telemetry: List<SpanData>): OperationResultCode {
         exportedSpans += telemetry
-        return OperationResultCode.Success
+        return exportResult
     }
 
     override suspend fun forceFlush(): OperationResultCode = OperationResultCode.Success

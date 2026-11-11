@@ -10,4 +10,12 @@ import io.opentelemetry.kotlin.tracing.Tracer
 class ExternalReplayTracer(
     val tracer: Tracer,
     val rootContext: Context,
-)
+    private val flushAction: () -> Boolean,
+) {
+
+    /**
+     * Flushes every external processor and reports whether all spans ended since the last flush were exported.
+     * Callers must only treat replayed telemetry as delivered when this returns true.
+     */
+    fun flush(): Boolean = flushAction()
+}

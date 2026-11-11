@@ -5,6 +5,7 @@ import io.embrace.android.embracesdk.internal.arch.schema.PrivateSpan
 import io.embrace.android.embracesdk.internal.delivery.SupportedEnvelopeType
 import io.embrace.android.embracesdk.internal.logging.InternalErrorType
 import io.embrace.android.embracesdk.internal.logging.InternalLogger
+import io.embrace.android.embracesdk.internal.otel.sdk.ExternalReplayLogger
 import io.embrace.android.embracesdk.internal.otel.sdk.ExternalReplayTracer
 import io.embrace.android.embracesdk.internal.otel.sdk.findAttributeValue
 import io.embrace.android.embracesdk.internal.payload.Envelope
@@ -35,9 +36,17 @@ import java.util.zip.GZIPInputStream
  *
  * Everything else is reported as delivered without being replayed: in OTel-only mode it was already exported live,
  * so replaying it would duplicate it.
+ *
+ * A payload is only reported as delivered once the replay pipeline has been flushed and every exporter succeeded.
+ * Otherwise it is kept and retried, so a crash is not lost when the device is offline on the next launch.
+ *
+ * Crashes may be delivered twice. External exporters are called synchronously on the crashing thread, so a fast,
+ * synchronous exporter can deliver the crash live before the process dies, and it is replayed again here. Replayed
+ * telemetry carries [REPLAYED_ATTRIBUTE] so backends can deduplicate on `log.record.uid`. A retry after a partial
+ * failure also re-sends to exporters that already succeeded.
  */
 class OtelReplayRequestExecutionService(
-    private val replayLoggerProvider: () -> Logger?,
+    private val replayLoggerProvider: () -> ExternalReplayLogger?,
     private val serializer: PlatformSerializer,
     private val logger: InternalLogger,
     private val replayTracerProvider: () -> ExternalReplayTracer? = { null },
@@ -57,39 +66,46 @@ class OtelReplayRequestExecutionService(
 
     private fun replayCrashes(payloadStream: () -> InputStream): ExecutionResult {
         val replayLogger = replayLoggerProvider() ?: return ExecutionResult.Success
-        return readAndReplay {
+        return readAndReplay(flush = replayLogger::flush) {
             val envelope: Envelope<LogPayload> = GZIPInputStream(payloadStream()).use {
                 serializer.fromJson(it, Envelope.logEnvelopeType)
             }
-            envelope.data.logs
-                ?.filter(::isReplayable)
-                ?.forEach { replay(replayLogger, it) }
+            val logs = envelope.data.logs?.filter(::isReplayable).orEmpty()
+            logs.forEach { replay(replayLogger.logger, it) }
+            logs.isNotEmpty()
         }
     }
 
     private fun replayThreadBlockages(payloadStream: () -> InputStream): ExecutionResult {
         val replayTracer = replayTracerProvider() ?: return ExecutionResult.Success
-        return readAndReplay {
+        return readAndReplay(flush = replayTracer::flush) {
             val envelope: Envelope<SessionPartPayload> = GZIPInputStream(payloadStream()).use {
                 serializer.fromJson(it, Envelope.sessionEnvelopeType)
             }
             val sessionId = envelope.getSessionId()
-            ((envelope.data.spans ?: emptyList()) + (envelope.data.spanSnapshots ?: emptyList()))
+            val blockages = ((envelope.data.spans ?: emptyList()) + (envelope.data.spanSnapshots ?: emptyList()))
                 .filter(::isUnexportedThreadBlockage)
                 .distinctBy { it.spanId }
-                .forEach { replay(replayTracer, it, sessionId) }
+            blockages.forEach { replay(replayTracer, it, sessionId) }
+            blockages.isNotEmpty()
         }
     }
 
-    private fun readAndReplay(action: () -> Unit): ExecutionResult {
-        return try {
-            action()
-            ExecutionResult.Success
+    /**
+     * Runs [replay], which returns whether it replayed anything, then flushes the pipeline. An unreadable payload is
+     * not retried because it will not become readable; a failed export is, because the exporter may recover.
+     */
+    private fun readAndReplay(flush: () -> Boolean, replay: () -> Boolean): ExecutionResult {
+        val replayed = try {
+            replay()
         } catch (exc: Throwable) {
             logger.trackInternalError(InternalErrorType.PayloadDeliveryFail, exc)
-            // An unreadable payload will not become readable on retry, so let it be cleaned up.
-            ExecutionResult.Incomplete(exc, retry = false)
+            return ExecutionResult.Incomplete(exc, retry = false)
         }
+        if (!replayed || flush()) {
+            return ExecutionResult.Success
+        }
+        return ExecutionResult.Incomplete(IllegalStateException("Replay to external OTel exporters failed"), retry = true)
     }
 
     private fun isReplayable(log: Log): Boolean {
@@ -118,6 +134,7 @@ class OtelReplayRequestExecutionService(
         replayLogger.emit(
             body = log.body,
             timestamp = log.timeUnixNano,
+            // Stored as the enum ordinal by LogMapper (not the OTel severity number), so read it back the same way.
             severityNumber = log.severityNumber?.let { SeverityNumber.entries.getOrNull(it) },
             severityText = log.severityText,
             attributes = {
@@ -176,7 +193,7 @@ class OtelReplayRequestExecutionService(
         const val REPLAYED_ATTRIBUTE = "emb.delivery.replayed"
 
         /**
-         * Crashes captured while the process is dying, which is too late for live export. Native crashes are not
+         * Crashes captured while the process is dying, when live export may not complete. Native crashes are not
          * included: they are emitted on the next launch while the process is healthy, so live export delivers them.
          */
         val crashTypes = setOf(
