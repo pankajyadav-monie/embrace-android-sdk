@@ -113,6 +113,8 @@ class OtelSdkConfig(
 
     fun getExternalSpanProcessors(): List<SpanProcessor> = externalSpanProcessors.toList()
 
+    fun getExternalSpanExporters(): List<SpanExporter> = externalSpanExporters.toList()
+
     fun addLogExporter(logExporter: LogRecordExporter) {
         externalLogExporters.add(logExporter)
     }

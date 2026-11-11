@@ -123,7 +123,7 @@ internal class InitializedModuleGraph(
             null
         } else {
             // Without an app ID, keep the full delivery pipeline (persistence, crash handling, resurrection) but
-            // deliver persisted crashes to the configured OTel exporters instead of the Embrace backend.
+            // deliver persisted crashes and thread blockages to the configured OTel exporters instead of the Embrace backend.
             val requestExecutionServiceProvider: Provider<RequestExecutionService>? = when {
                 otelOnly -> {
                     {
@@ -131,6 +131,7 @@ internal class InitializedModuleGraph(
                             replayLoggerProvider = { openTelemetryModule.otelSdkWrapper.externalReplayLogger },
                             serializer = initModule.jsonSerializer,
                             logger = initModule.logger,
+                            replayTracerProvider = { openTelemetryModule.otelSdkWrapper.externalReplayTracer },
                         )
                     }
                 }

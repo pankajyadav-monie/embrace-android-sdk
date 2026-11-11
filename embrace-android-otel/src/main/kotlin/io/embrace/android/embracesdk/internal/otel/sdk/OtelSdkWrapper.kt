@@ -13,6 +13,8 @@ import io.embrace.android.embracesdk.internal.otel.impl.EmbTracerProvider
 import io.embrace.android.embracesdk.internal.otel.logs.DefaultLogRecordProcessor
 import io.embrace.android.embracesdk.internal.otel.logs.EventService
 import io.embrace.android.embracesdk.internal.otel.logs.ExternalLogRecordExporter
+import io.embrace.android.embracesdk.internal.otel.spans.ExportOnEndSpanProcessor
+import io.embrace.android.embracesdk.internal.otel.spans.ExternalSpanExporter
 import io.embrace.android.embracesdk.internal.otel.spans.SpanService
 import io.embrace.android.embracesdk.internal.utils.EmbTrace
 import io.opentelemetry.kotlin.Clock
@@ -95,6 +97,50 @@ class OtelSdkWrapper(
             ).loggerProvider.getLogger(
                 name = configuration.sdkName,
                 version = configuration.sdkVersion,
+            )
+        }
+    }
+
+    /**
+     * A tracer whose pipeline contains only the externally registered span processors and exporters, not Embrace's
+     * own processor. It is used to replay spans that were persisted to disk in a previous process (e.g. thread
+     * blockages from a session whose process was killed) so they reach the configured OTel destinations.
+     *
+     * Null when no external span export is configured.
+     */
+    @Suppress("SpreadOperator")
+    val externalReplayTracer: ExternalReplayTracer? by lazy {
+        val processors = configuration.getExternalSpanProcessors()
+        val exporters = configuration.getExternalSpanExporters()
+        if (processors.isEmpty() && exporters.isEmpty()) {
+            return@lazy null
+        }
+        EmbTrace.trace("otel-replay-tracer-init") {
+            val exportProcessors = when {
+                exporters.isEmpty() -> processors
+                else -> processors + ExportOnEndSpanProcessor(ExternalSpanExporter(exporters))
+            }
+            val instance = createSdkOtelInstance(
+                useKotlinSdk = useKotlinSdk,
+                tracerProvider = {
+                    resource(attributes = configuration.resourceAction)
+                    spanLimits {
+                        eventCountLimit = limits.getMaxTotalEventCount()
+                        attributeCountLimit = limits.getMaxTotalAttributeCount()
+                        linkCountLimit = limits.getMaxTotalLinkCount()
+                    }
+                    export {
+                        compositeSpanProcessor(*exportProcessors.toTypedArray())
+                    }
+                },
+                clock = otelClock,
+            )
+            ExternalReplayTracer(
+                tracer = instance.tracerProvider.getTracer(
+                    name = configuration.sdkName,
+                    version = configuration.sdkVersion,
+                ),
+                rootContext = instance.context.root(),
             )
         }
     }

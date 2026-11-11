@@ -4,6 +4,7 @@ import io.embrace.android.embracesdk.fakes.FakeClock
 import io.embrace.android.embracesdk.fakes.FakeInternalLogger
 import io.embrace.android.embracesdk.fakes.FakeLogRecordExporter
 import io.embrace.android.embracesdk.fakes.FakeOtelKotlinClock
+import io.embrace.android.embracesdk.fakes.FakeSpanExporter
 import io.embrace.android.embracesdk.fakes.FakeSpanService
 import io.embrace.android.embracesdk.internal.SystemInfo
 import io.embrace.android.embracesdk.internal.delivery.SupportedEnvelopeType
@@ -16,10 +17,14 @@ import io.embrace.android.embracesdk.internal.payload.Attribute
 import io.embrace.android.embracesdk.internal.payload.Envelope
 import io.embrace.android.embracesdk.internal.payload.Log
 import io.embrace.android.embracesdk.internal.payload.LogPayload
+import io.embrace.android.embracesdk.internal.payload.SessionPartPayload
+import io.embrace.android.embracesdk.internal.payload.Span
+import io.embrace.android.embracesdk.internal.payload.SpanEvent
 import io.embrace.android.embracesdk.internal.serialization.EmbraceSerializer
 import io.opentelemetry.kotlin.logging.SeverityNumber
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -27,9 +32,12 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.util.zip.GZIPOutputStream
 
+private const val SESSION_ID = "EB4952FBA6464E09A9CDD791A8BC02DE"
+
 internal class OtelReplayRequestExecutionServiceTest {
 
     private lateinit var exporter: FakeLogRecordExporter
+    private lateinit var spanExporter: FakeSpanExporter
     private lateinit var logger: FakeInternalLogger
     private lateinit var service: OtelReplayRequestExecutionService
     private val serializer = EmbraceSerializer()
@@ -46,9 +54,46 @@ internal class OtelReplayRequestExecutionServiceTest {
         ),
     )
 
+    /** The session span of a cached session whose process was killed, as it is delivered after resurrection. */
+    private val sessionSpan = Span(
+        spanId = "c0ffee0000000001",
+        name = "emb-session",
+        startTimeNanos = 1_700_000_000_000_000_000,
+        endTimeNanos = 1_700_000_060_000_000_000,
+        status = Span.Status.ERROR,
+        attributes = listOf(
+            Attribute("emb.type", "ux.session"),
+            Attribute("session.id", SESSION_ID),
+            Attribute("emb.error_code", "failure"),
+        ),
+    )
+
+    /** A thread blockage as the ANR snapshot mapper writes it into a cached session: no pipeline attributes. */
+    private val snapshotBlockage = Span(
+        traceId = "0123456789abcdef0123456789abcdef",
+        spanId = "c0ffee0000000002",
+        parentSpanId = "0000000000000000",
+        name = "emb-thread-blockage",
+        startTimeNanos = 1_700_000_010_000_000_000,
+        endTimeNanos = 1_700_000_050_000_000_000,
+        status = Span.Status.UNSET,
+        attributes = listOf(
+            Attribute("emb.type", "perf.thread_blockage"),
+            Attribute("interval_code", "1"),
+        ),
+        events = listOf(
+            SpanEvent(
+                name = "perf.thread_blockage_sample",
+                timestampNanos = 1_700_000_012_000_000_000,
+                attributes = listOf(Attribute("frames", "main-thread-stack")),
+            ),
+        ),
+    )
+
     @Before
     fun setUp() {
         exporter = FakeLogRecordExporter()
+        spanExporter = FakeSpanExporter()
         logger = FakeInternalLogger(throwOnInternalError = false)
         val config = OtelSdkConfig(
             spanSink = SpanSinkImpl(),
@@ -58,7 +103,10 @@ internal class OtelReplayRequestExecutionServiceTest {
             appVersion = "2.5.1",
             packageName = "com.test.app",
             systemInfo = SystemInfo(),
-        ).apply { addLogExporter(exporter) }
+        ).apply {
+            addLogExporter(exporter)
+            addSpanExporter(spanExporter)
+        }
         lateinit var wrapper: OtelSdkWrapper
         wrapper = OtelSdkWrapper(
             otelClock = FakeOtelKotlinClock(FakeClock()),
@@ -71,6 +119,7 @@ internal class OtelReplayRequestExecutionServiceTest {
             replayLoggerProvider = { wrapper.externalReplayLogger },
             serializer = serializer,
             logger = logger,
+            replayTracerProvider = { wrapper.externalReplayTracer },
         )
     }
 
@@ -93,8 +142,80 @@ internal class OtelReplayRequestExecutionServiceTest {
         val log = crashLog.copy(attributes = listOf(Attribute("emb.type", "sys.log")))
 
         assertEquals(ExecutionResult.Success, deliver(SupportedEnvelopeType.LOG, log))
-        assertEquals(ExecutionResult.Success, deliver(SupportedEnvelopeType.SESSION, log))
         assertTrue(exporter.exportedLogs.isEmpty())
+    }
+
+    @Test
+    fun `thread blockage from a killed session is replayed with its original data`() {
+        val result = deliverSession(SessionPartPayload(spans = listOf(sessionSpan, snapshotBlockage)))
+
+        assertEquals(ExecutionResult.Success, result)
+        val replayed = spanExporter.exportedSpans.single()
+        assertEquals("emb-thread-blockage", replayed.name)
+        assertEquals(snapshotBlockage.startTimeNanos, replayed.startTimestamp)
+        assertEquals(snapshotBlockage.endTimeNanos, replayed.endTimestamp)
+        assertEquals("perf.thread_blockage", replayed.attributes["emb.type"])
+        assertEquals("1", replayed.attributes["interval_code"])
+        assertEquals(SESSION_ID, replayed.attributes["session.id"])
+        assertEquals("true", replayed.attributes["emb.delivery.replayed"])
+        assertNull(replayed.attributes["emb.private.sequence_id"])
+        val sample = replayed.events.single()
+        assertEquals("perf.thread_blockage_sample", sample.name)
+        assertEquals(snapshotBlockage.events?.single()?.timestampNanos, sample.timestamp)
+        assertEquals("main-thread-stack", sample.attributes["frames"])
+    }
+
+    @Test
+    fun `thread blockage still in the span snapshots is replayed once`() {
+        val payload = SessionPartPayload(
+            spans = listOf(snapshotBlockage),
+            spanSnapshots = listOf(sessionSpan, snapshotBlockage),
+        )
+
+        assertEquals(ExecutionResult.Success, deliverSession(payload))
+        assertEquals(1, spanExporter.exportedSpans.size)
+    }
+
+    @Test
+    fun `thread blockage already exported live is not replayed`() {
+        val liveBlockage = snapshotBlockage.copy(
+            attributes = snapshotBlockage.attributes.orEmpty() + Attribute("emb.private.sequence_id", "42"),
+        )
+        val networkSpan = Span(
+            spanId = "c0ffee0000000003",
+            name = "emb-GET /api",
+            startTimeNanos = 1L,
+            endTimeNanos = 2L,
+            attributes = listOf(Attribute("emb.type", "perf.network_request")),
+        )
+
+        val result = deliverSession(SessionPartPayload(spans = listOf(sessionSpan, liveBlockage, networkSpan)))
+
+        assertEquals(ExecutionResult.Success, result)
+        assertTrue(spanExporter.exportedSpans.isEmpty())
+    }
+
+    @Test
+    fun `private thread blockage is not replayed`() {
+        val privateBlockage = snapshotBlockage.copy(
+            attributes = snapshotBlockage.attributes.orEmpty() + Attribute("emb.private", "true"),
+        )
+
+        assertEquals(ExecutionResult.Success, deliverSession(SessionPartPayload(spans = listOf(privateBlockage))))
+        assertTrue(spanExporter.exportedSpans.isEmpty())
+    }
+
+    @Test
+    fun `unreadable session payload is reported and not retried`() {
+        val result = service.attemptHttpRequest(
+            payloadStream = { ByteArrayInputStream("not gzip".toByteArray()) },
+            envelopeType = SupportedEnvelopeType.SESSION,
+            payloadType = "session",
+        )
+
+        assertTrue(result is ExecutionResult.Incomplete)
+        assertFalse(result.shouldRetry)
+        assertTrue(spanExporter.exportedSpans.isEmpty())
     }
 
     @Test
@@ -124,6 +245,20 @@ internal class OtelReplayRequestExecutionServiceTest {
         assertTrue(result is ExecutionResult.Incomplete)
         assertFalse(result.shouldRetry)
         assertEquals(1, logger.internalErrorMessages.size)
+    }
+
+    private fun deliverSession(payload: SessionPartPayload): ExecutionResult {
+        val bytes = ByteArrayOutputStream().use { out ->
+            GZIPOutputStream(out).use { gzip ->
+                serializer.toJson(Envelope(data = payload), Envelope.sessionEnvelopeType, gzip)
+            }
+            out.toByteArray()
+        }
+        return service.attemptHttpRequest(
+            payloadStream = { ByteArrayInputStream(bytes) },
+            envelopeType = SupportedEnvelopeType.SESSION,
+            payloadType = "session",
+        )
     }
 
     private fun deliver(type: SupportedEnvelopeType, log: Log): ExecutionResult {
