@@ -4,13 +4,15 @@ import io.opentelemetry.kotlin.export.OperationResultCode
 import io.opentelemetry.kotlin.logging.export.LogRecordExporter
 import io.opentelemetry.kotlin.logging.model.ReadableLogRecord
 
-class FakeLogRecordExporter : LogRecordExporter {
+class FakeLogRecordExporter(
+    var exportResult: OperationResultCode = OperationResultCode.Success,
+) : LogRecordExporter {
 
     val exportedLogs: MutableList<ReadableLogRecord> = mutableListOf()
 
     override suspend fun export(telemetry: List<ReadableLogRecord>): OperationResultCode {
         exportedLogs += telemetry
-        return OperationResultCode.Success
+        return exportResult
     }
 
     override suspend fun shutdown(): OperationResultCode = OperationResultCode.Success

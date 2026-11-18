@@ -3,7 +3,9 @@ package io.embrace.android.embracesdk.internal.otel.config
 import io.embrace.android.embracesdk.internal.SystemInfo
 import io.embrace.android.embracesdk.internal.otel.logs.DefaultLogRecordExporter
 import io.embrace.android.embracesdk.internal.otel.logs.DefaultLogRecordProcessor
+import io.embrace.android.embracesdk.internal.otel.logs.LiveExportFilteringLogRecordProcessor
 import io.embrace.android.embracesdk.internal.otel.logs.LogSink
+import io.embrace.android.embracesdk.internal.otel.logs.isProcessTerminatingCrash
 import io.embrace.android.embracesdk.internal.otel.sdk.IdGenerator
 import io.embrace.android.embracesdk.internal.otel.spans.DefaultSpanExporter
 import io.embrace.android.embracesdk.internal.otel.spans.EmbraceSpanProcessor
@@ -12,6 +14,7 @@ import io.embrace.android.embracesdk.internal.utils.EmbTrace
 import io.opentelemetry.kotlin.attributes.AttributesMutator
 import io.opentelemetry.kotlin.logging.export.LogRecordExporter
 import io.opentelemetry.kotlin.logging.export.LogRecordProcessor
+import io.opentelemetry.kotlin.logging.model.ReadableLogRecord
 import io.opentelemetry.kotlin.semconv.AndroidAttributes
 import io.opentelemetry.kotlin.semconv.DeviceAttributes
 import io.opentelemetry.kotlin.semconv.OsAttributes
@@ -34,6 +37,13 @@ class OtelSdkConfig(
 ) {
 
     private val customAttributes: MutableMap<String, String> = ConcurrentHashMap()
+
+    /**
+     * Supplies the current user identifier for the `user.id` span attribute. Set during SDK init, once the
+     * user service exists; read on every span start.
+     */
+    @Volatile
+    var userIdProvider: () -> String? = { null }
 
     val resourceAction: AttributesMutator.() -> Unit
         get() = {
@@ -76,6 +86,28 @@ class OtelSdkConfig(
         exportEnabled = false
     }
 
+    @Volatile
+    private var liveCrashExportEnabled: Boolean = true
+
+    /**
+     * Whether a log should be exported live to the external exporters and processors. Crash logs are held back when
+     * live crash export is disabled.
+     */
+    private val liveExportFilter: (ReadableLogRecord) -> Boolean = {
+        liveCrashExportEnabled || !it.isProcessTerminatingCrash()
+    }
+
+    /**
+     * Stops JVM and React Native crash logs from being exported live to the external exporters and processors. They
+     * are still persisted and are delivered once, by replaying them on the next launch.
+     *
+     * Used in OTel-only mode: a crash exported live from the dying process often still reaches the backend, and the
+     * replay then delivers it a second time.
+     */
+    fun disableLiveCrashExport() {
+        liveCrashExportEnabled = false
+    }
+
     private val spanExporter: SpanExporter by lazy {
         DefaultSpanExporter(
             spanSink = spanSink,
@@ -87,7 +119,8 @@ class OtelSdkConfig(
         EmbraceSpanProcessor(
             sessionIdProvider,
             processIdentifier,
-            spanExporter
+            spanExporter,
+            userIdProvider = { userIdProvider() },
         )
     }
 
@@ -96,6 +129,7 @@ class OtelSdkConfig(
             logSink = logSink,
             externalExporters = externalLogExporters.toList(),
             exportCheck = exportCheck,
+            externalExportFilter = liveExportFilter,
         )
     }
 
@@ -113,6 +147,8 @@ class OtelSdkConfig(
 
     fun getExternalSpanProcessors(): List<SpanProcessor> = externalSpanProcessors.toList()
 
+    fun getExternalSpanExporters(): List<SpanExporter> = externalSpanExporters.toList()
+
     fun addLogExporter(logExporter: LogRecordExporter) {
         externalLogExporters.add(logExporter)
     }
@@ -122,6 +158,14 @@ class OtelSdkConfig(
     }
 
     fun getExternalLogRecordProcessors(): List<LogRecordProcessor> = externalLogRecordProcessors.toList()
+
+    /**
+     * The external log processors for the live pipeline, which skip logs that must not be exported live.
+     */
+    fun getLiveExternalLogRecordProcessors(): List<LogRecordProcessor> =
+        externalLogRecordProcessors.map { LiveExportFilteringLogRecordProcessor(it, liveExportFilter) }
+
+    fun getExternalLogExporters(): List<LogRecordExporter> = externalLogExporters.toList()
 
     fun hasConfiguredOtlpExport(): Boolean = externalLogExporters.isNotEmpty() || externalLogRecordProcessors.isNotEmpty() ||
         externalSpanExporters.isNotEmpty() || externalSpanProcessors.isNotEmpty()

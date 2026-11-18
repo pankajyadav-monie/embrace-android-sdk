@@ -20,6 +20,12 @@ class FakeLogRecordProcessor(
         onEmitAction(log)
     }
 
-    override suspend fun forceFlush(): OperationResultCode = OperationResultCode.Success
+    var forceFlushResult: OperationResultCode = OperationResultCode.Success
+    var forceFlushCount: Int = 0
+
+    override suspend fun forceFlush(): OperationResultCode {
+        forceFlushCount++
+        return forceFlushResult
+    }
     override suspend fun shutdown(): OperationResultCode = OperationResultCode.Success
 }
