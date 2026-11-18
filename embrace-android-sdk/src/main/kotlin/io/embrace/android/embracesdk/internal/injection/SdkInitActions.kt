@@ -16,7 +16,9 @@ import io.embrace.android.embracesdk.internal.utils.Provider
 import io.embrace.android.embracesdk.internal.worker.Worker
 import io.embrace.android.embracesdk.semconv.EmbSessionAttributes
 import io.opentelemetry.kotlin.semconv.SessionAttributes
+import io.opentelemetry.kotlin.semconv.UserAttributes
 import java.util.ServiceLoader
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Performs bootstrapping by setting required values where there is an interdependency
@@ -44,6 +46,8 @@ internal fun ModuleGraph.postInit() {
     openTelemetryModule.logSink.registerLogStoredCallback {
         logModule.logOrchestrator.onLogsAdded()
     }
+
+    exportUserIdentifier()
 
     essentialServiceModule.telemetryDestination.sessionUpdateAction =
         userSessionOrchestrationModule.sessionOrchestrator::onSessionDataUpdate
@@ -177,6 +181,28 @@ internal fun ModuleGraph.markSdkInitComplete() {
     initModule.logger.logInfo(startMsg)
 }
 
+/**
+ * Exports the user identifier (Embrace.setUserIdentifier) as the OTel attribute `user.id`: on every span at
+ * start, on the current session span when it changes, and on every log/event. Only the identifier is
+ * exported, never the user name or email, so callers must pass an opaque (pseudonymous) ID.
+ */
+private fun ModuleGraph.exportUserIdentifier() {
+    val userService = essentialServiceModule.userService
+    val current = AtomicReference(userService.getUserInfo().userId?.takeIf { it.isNotBlank() })
+    openTelemetryModule.otelSdkConfig.userIdProvider = current::get
+    userService.addUserInfoListener {
+        val userId = userService.getUserInfo().userId?.takeIf { it.isNotBlank() }
+        if (current.getAndSet(userId) != userId) {
+            val destination = essentialServiceModule.telemetryDestination
+            if (userId != null) {
+                destination.addSessionPartAttribute(UserAttributes.USER_ID, userId)
+            } else {
+                destination.removeSessionPartAttribute(UserAttributes.USER_ID)
+            }
+        }
+    }
+}
+
 private fun ModuleGraph.eventMetadataSupplierProvider(): Provider<Map<String, String>> {
     return {
         mutableMapOf<String, String>().apply {
@@ -189,6 +215,7 @@ private fun ModuleGraph.eventMetadataSupplierProvider(): Provider<Map<String, St
             }
             val state = sessionState ?: essentialServiceModule.appStateTracker.getAppState()
             put(EmbSessionAttributes.EMB_STATE, state.description)
+            openTelemetryModule.otelSdkConfig.userIdProvider()?.let { put(UserAttributes.USER_ID, it) }
             putAll(
                 essentialServiceModule.userSessionPropertiesService
                     .getProperties()

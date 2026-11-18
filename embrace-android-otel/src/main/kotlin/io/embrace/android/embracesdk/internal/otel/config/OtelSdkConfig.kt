@@ -38,6 +38,13 @@ class OtelSdkConfig(
 
     private val customAttributes: MutableMap<String, String> = ConcurrentHashMap()
 
+    /**
+     * Supplies the current user identifier for the `user.id` span attribute. Set during SDK init, once the
+     * user service exists; read on every span start.
+     */
+    @Volatile
+    var userIdProvider: () -> String? = { null }
+
     val resourceAction: AttributesMutator.() -> Unit
         get() = {
             setStringAttribute(ServiceAttributes.SERVICE_NAME, packageName)
@@ -112,7 +119,8 @@ class OtelSdkConfig(
         EmbraceSpanProcessor(
             sessionIdProvider,
             processIdentifier,
-            spanExporter
+            spanExporter,
+            userIdProvider = { userIdProvider() },
         )
     }
 
